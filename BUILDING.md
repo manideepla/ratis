@@ -27,7 +27,7 @@ Project could be built as a usual Maven project:
 $ mvn clean package -DskipTests
 ```
 
-Note: subsequent builds could be faster with skiping shading/protobuf compile steps.
+Note: subsequent builds could be faster with skipping shading/protobuf compile steps.
 See the next section for more info.
 
 # Thirdparty
