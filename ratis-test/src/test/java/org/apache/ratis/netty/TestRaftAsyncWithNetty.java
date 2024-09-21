@@ -15,36 +15,11 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.apache.ratis.shell.cli.sh.command;
+package org.apache.ratis.netty;
 
-import org.apache.ratis.shell.cli.Command;
+import org.apache.ratis.RaftAsyncTests;
 
-import java.io.PrintStream;
-
-/**
- * The base class for all the ratis shell {@link Command} classes.
- */
-public abstract class AbstractCommand implements Command {
-
-  private final Context context;
-
-  protected AbstractCommand(Context context) {
-    this.context = context;
-  }
-
-  protected Context getContext() {
-    return context;
-  }
-
-  protected PrintStream getPrintStream() {
-    return getContext().getPrintStream();
-  }
-
-  protected void printf(String format, Object... args) {
-    getPrintStream().printf(format, args);
-  }
-
-  protected void println(Object message) {
-    getPrintStream().println(message);
-  }
+public class TestRaftAsyncWithNetty
+    extends RaftAsyncTests<MiniRaftClusterWithNetty>
+    implements MiniRaftClusterWithNetty.FactoryGet {
 }

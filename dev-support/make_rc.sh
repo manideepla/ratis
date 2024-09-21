@@ -96,7 +96,7 @@ prepare-src() {
   git reset --hard
   git clean -fdx
   mvnFun versions:set -DnewVersion="$RATISVERSION"
-  git commit -a -m "Change version for the version $RATISVERSION $RC"
+  git commit --allow-empty -a -m "Change version for the version $RATISVERSION $RC"
 
   git config user.signingkey "${CODESIGNINGKEY}"
   git tag -s -m "Release $RATISVERSION $RC" ratis-"${RATISVERSION}${RC}"
@@ -114,7 +114,7 @@ prepare-bin() {
   rm -rf "$WORKINGDIR"
   mkdir -p "$WORKINGDIR"
   cd "$WORKINGDIR"
-  tar zvxf "$projectdir/ratis-assembly/target/apache-ratis-${RATISVERSION}-src.tar.gz"
+  tar zvxf "$projectdir/ratis-assembly/target/ratis-assembly-${RATISVERSION}-src.tar.gz"
   mv "apache-ratis-${RATISVERSION}-src" "apache-ratis-${RATISVERSION}"
   cd "apache-ratis-${RATISVERSION}"
 
@@ -126,8 +126,8 @@ assembly() {
   RCDIR="$SVNDISTDIR/${RATISVERSION}/${RC#-}"
   mkdir -p "$RCDIR"
   cd "$RCDIR"
-  cp "$WORKINGDIR/apache-ratis-${RATISVERSION}/ratis-assembly/target/apache-ratis-${RATISVERSION}-bin.tar.gz" "apache-ratis-${RATISVERSION}-bin.tar.gz"
-  cp "$projectdir/ratis-assembly/target/apache-ratis-${RATISVERSION}-src.tar.gz" "apache-ratis-${RATISVERSION}-src.tar.gz"
+  cp "$WORKINGDIR/apache-ratis-${RATISVERSION}/ratis-assembly/target/ratis-assembly-${RATISVERSION}-bin.tar.gz" "apache-ratis-${RATISVERSION}-bin.tar.gz"
+  cp "$projectdir/ratis-assembly/target/ratis-assembly-${RATISVERSION}-src.tar.gz" "apache-ratis-${RATISVERSION}-src.tar.gz"
   for i in *.tar.gz; do gpg  -u "${CODESIGNINGKEY}" --armor --output "${i}.asc" --detach-sig "${i}"; done
   for i in *.tar.gz; do gpg --print-md SHA512 "${i}" > "${i}.sha512"; done
   for i in *.tar.gz; do gpg --print-mds "${i}" > "${i}.mds"; done
@@ -147,7 +147,7 @@ publish-svn() {
 
 publish-mvn(){
   cd "$projectdir"
-  mvnFun -X clean deploy assembly:single -DskipTests=true  -Prelease -Papache-release -Dgpg.keyname="${CODESIGNINGKEY}"
+  mvnFun clean deploy -DskipTests=true  -Prelease -Papache-release -Dgpg.keyname="${CODESIGNINGKEY}"
 }
 
 if [ "$#" -ne 1 ]; then

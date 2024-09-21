@@ -620,7 +620,7 @@ class LeaderStateImpl implements LeaderState {
       List<LogEntryProto> entries, TermIndex previous, long callId) {
     final boolean initializing = !isCaughtUp(follower);
     final RaftPeerId targetId = follower.getId();
-    return ServerProtoUtils.toAppendEntriesRequestProto(server.getMemberId(), targetId, currentTerm, entries,
+    return ServerProtoUtils.toAppendEntriesRequestProto(server.getMemberId(), targetId, getCurrentTerm(), entries,
         ServerImplUtils.effectiveCommitIndex(raftLog.getLastCommittedIndex(), previous, entries.size()),
         initializing, previous, server.getCommitInfos(), callId);
   }
@@ -700,7 +700,7 @@ class LeaderStateImpl implements LeaderState {
   }
 
   void submitStepDownEvent(StepDownReason reason) {
-    submitStepDownEvent(getCurrentTerm(), reason);
+    submitStepDownEvent(currentTerm, reason);
   }
 
   void submitStepDownEvent(long term, StepDownReason reason) {
@@ -948,10 +948,7 @@ class LeaderStateImpl implements LeaderState {
 
   private void updateCommit(LogEntryHeader[] entriesToCommit) {
     final long newCommitIndex = raftLog.getLastCommittedIndex();
-    if (logMetadataEnabled) {
-      logMetadata(newCommitIndex);
-    }
-    commitIndexChanged();
+    long lastCommitIndex = RaftLog.INVALID_LOG_INDEX;
 
     boolean hasConfiguration = false;
     for (LogEntryHeader entry : entriesToCommit) {
@@ -960,7 +957,14 @@ class LeaderStateImpl implements LeaderState {
       }
       hasConfiguration |= entry.getLogEntryBodyCase() == LogEntryBodyCase.CONFIGURATIONENTRY;
       raftLog.getRaftLogMetrics().onLogEntryCommitted(entry);
+      if (entry.getLogEntryBodyCase() != LogEntryBodyCase.METADATAENTRY) {
+        lastCommitIndex = entry.getIndex();
+      }
     }
+    if (logMetadataEnabled && lastCommitIndex != RaftLog.INVALID_LOG_INDEX) {
+      logMetadata(lastCommitIndex);
+    }
+    commitIndexChanged();
     if (hasConfiguration) {
       checkAndUpdateConfiguration();
     }
@@ -980,8 +984,9 @@ class LeaderStateImpl implements LeaderState {
   }
 
   private void logMetadata(long commitIndex) {
-    raftLog.appendMetadata(currentTerm, commitIndex);
-    notifySenders();
+    if (raftLog.appendMetadata(currentTerm, commitIndex) != RaftLog.INVALID_LOG_INDEX) {
+      notifySenders();
+    }
   }
 
   private void checkAndUpdateConfiguration() {

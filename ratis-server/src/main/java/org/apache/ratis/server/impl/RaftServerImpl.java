@@ -17,6 +17,7 @@
  */
 package org.apache.ratis.server.impl;
 
+import java.util.concurrent.CountDownLatch;
 import org.apache.ratis.client.impl.ClientProtoUtils;
 import org.apache.ratis.conf.RaftProperties;
 import org.apache.ratis.metrics.Timekeeper;
@@ -229,6 +230,7 @@ class RaftServerImpl implements RaftServer.Division,
   private final RaftServerJmxAdapter jmxAdapter = new RaftServerJmxAdapter(this);
   private final LeaderElectionMetrics leaderElectionMetrics;
   private final RaftServerMetricsImpl raftServerMetrics;
+  private final CountDownLatch closeFinishedLatch = new CountDownLatch(1);
 
   // To avoid append entry before complete start() method
   // For example, if thread1 start(), but before thread1 startAsFollower(), thread2 receive append entry
@@ -463,6 +465,13 @@ class RaftServerImpl implements RaftServer.Division,
     /* Shutdown is triggered here inorder to avoid any locked files. */
     state.getStateMachineUpdater().setRemoving();
     close();
+    try {
+      closeFinishedLatch.await();
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      LOG.warn("{}: Waiting closing interrupted, will not continue to remove group locally", getMemberId());
+      return;
+    }
     getStateMachine().event().notifyGroupRemove();
     if (deleteDirectory) {
       for (int i = 0; i < FileUtils.NUM_ATTEMPTS; i ++) {
@@ -541,6 +550,7 @@ class RaftServerImpl implements RaftServer.Division,
       } catch (Exception e) {
         LOG.warn(getMemberId() + ": Failed to shutdown serverExecutor", e);
       }
+      closeFinishedLatch.countDown();
     });
   }
 
@@ -562,11 +572,10 @@ class RaftServerImpl implements RaftServer.Division,
       boolean allowListener,
       Object reason) {
     final RaftPeerRole old = role.getCurrentRole();
-    final boolean metadataUpdated = state.updateCurrentTerm(newTerm);
     if (old == RaftPeerRole.LISTENER && !allowListener) {
       throw new IllegalStateException("Unexpected role " + old);
     }
-
+    boolean metadataUpdated;
     if ((old != RaftPeerRole.FOLLOWER || force) && old != RaftPeerRole.LISTENER) {
       setRole(RaftPeerRole.FOLLOWER, reason);
       if (old == RaftPeerRole.LEADER) {
@@ -587,8 +596,11 @@ class RaftServerImpl implements RaftServer.Division,
       } else if (old == RaftPeerRole.FOLLOWER) {
         role.shutdownFollowerState();
       }
+      metadataUpdated = state.updateCurrentTerm(newTerm);
       role.startFollowerState(this, reason);
       setFirstElection(reason);
+    } else {
+      metadataUpdated = state.updateCurrentTerm(newTerm);
     }
     return metadataUpdated;
   }
@@ -1900,5 +1912,9 @@ class RaftServerImpl implements RaftServer.Division,
 
   void onGroupLeaderElected() {
     transferLeadership.complete(TransferLeadership.Result.SUCCESS);
+  }
+
+  boolean isRunning() {
+    return startComplete.get() && lifeCycle.getCurrentState() == State.RUNNING;
   }
 }

@@ -22,6 +22,7 @@
  */
 -->
   <id>src</id>
+  <baseDirectory>apache-ratis-${project.version}-src</baseDirectory>
   <formats>
     <format>tar.gz</format>
   </formats>
@@ -102,6 +103,7 @@
         <include>README.md</include>
         <include>mvnw.cmd</include>
         <include>pom.xml</include>
+        <include>src/**</include>
         <include>start-build-env.sh</include>
       </includes>
       <fileMode>0644</fileMode>
