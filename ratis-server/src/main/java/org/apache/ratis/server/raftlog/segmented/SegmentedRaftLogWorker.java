@@ -46,11 +46,13 @@ import org.slf4j.LoggerFactory;
 import java.io.File;
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.file.Path;
 import java.util.LinkedList;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Queue;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 
@@ -242,10 +244,11 @@ class SegmentedRaftLogWorker {
   }
 
   void close() {
+    queue.close();
     this.running = false;
+    ConcurrentUtils.shutdownAndWait(TimeDuration.ONE_MINUTE, workerThreadExecutor,
+        timeout -> LOG.warn("{}: shutdown timeout in {}", name, timeout));
     Optional.ofNullable(flushExecutor).ifPresent(ExecutorService::shutdown);
-    ConcurrentUtils.shutdownAndWait(TimeDuration.ONE_SECOND.multiply(3),
-        workerThreadExecutor, timeout -> LOG.warn("{}: shutdown timeout in " + timeout, name));
     IOUtils.cleanup(LOG, out);
     PlatformDependent.freeDirectBuffer(writeBuffer);
     LOG.info("{} close()", name);
@@ -341,7 +344,7 @@ class SegmentedRaftLogWorker {
         LOG.info(Thread.currentThread().getName()
             + " was interrupted, exiting. There are " + queue.getNumElements()
             + " tasks remaining in the queue.");
-        return;
+        break;
       } catch (Exception e) {
         if (!running) {
           LOG.info("{} got closed and hit exception",
@@ -352,6 +355,8 @@ class SegmentedRaftLogWorker {
         }
       }
     }
+
+    queue.clear(Task::discard);
   }
 
   private boolean shouldFlush() {
@@ -477,8 +482,10 @@ class SegmentedRaftLogWorker {
     void execute() throws IOException {
       if (segments.getToDelete() != null) {
         try(UncheckedAutoCloseable ignored = raftLogMetrics.startPurgeTimer()) {
-          for (SegmentFileInfo fileInfo : segments.getToDelete()) {
-            FileUtils.deleteFile(fileInfo.getFile(storage));
+          SegmentFileInfo[] toDeletes = segments.getToDelete();
+          for (int i = toDeletes.length - 1; i >= 0; i--) {
+            final Path deleted = FileUtils.deleteFile(toDeletes[i].getFile(storage));
+            LOG.info("{}: Purged RaftLog segment: info={}, path={}", name, toDeletes[i], deleted);
           }
         }
       }
@@ -494,7 +501,7 @@ class SegmentedRaftLogWorker {
     private final LogEntryProto entry;
     private final CompletableFuture<?> stateMachineFuture;
     private final CompletableFuture<Long> combined;
-    private final ReferenceCountedObject<LogEntryProto> ref;
+    private final AtomicReference<ReferenceCountedObject<LogEntryProto>> ref = new AtomicReference<>();
 
     WriteLog(ReferenceCountedObject<LogEntryProto> entryRef, LogEntryProto removedStateMachineData,
         TransactionContext context) {
@@ -512,7 +519,7 @@ class SegmentedRaftLogWorker {
           this.stateMachineFuture = null;
         }
         entryRef.retain();
-        this.ref = entryRef;
+        this.ref.set(entryRef);
       } else {
         try {
           // this.entry != origEntry if it has state machine data
@@ -522,7 +529,6 @@ class SegmentedRaftLogWorker {
               + ", entry=" + LogProtoUtils.toLogEntryString(origEntry, stateMachine::toStateMachineLogEntryString), e);
           throw e;
         }
-        this.ref = null;
       }
       this.combined = stateMachineFuture == null? super.getFuture()
           : super.getFuture().thenCombine(stateMachineFuture, (index, stateMachineResult) -> index);
@@ -532,6 +538,7 @@ class SegmentedRaftLogWorker {
     void failed(IOException e) {
       stateMachine.event().notifyLogFailed(e, entry);
       super.failed(e);
+      discard();
     }
 
     @Override
@@ -547,15 +554,14 @@ class SegmentedRaftLogWorker {
     @Override
     void done() {
       writeTasks.offerOrCompleteFuture(this);
-      if (ref != null) {
-        ref.release();
-      }
+      discard();
     }
 
     @Override
     void discard() {
-      if (ref != null) {
-        ref.release();
+      final ReferenceCountedObject<LogEntryProto> entryRef = ref.getAndSet(null);
+      if (entryRef != null) {
+        entryRef.release();
       }
     }
 
@@ -587,8 +593,8 @@ class SegmentedRaftLogWorker {
     }
   }
 
-  File getFile(long startIndex, Long endIndex) {
-    return LogSegmentStartEnd.valueOf(startIndex, endIndex).getFile(storage);
+  private File getFile(LogSegmentStartEnd startEnd) {
+    return startEnd.getFile(storage);
   }
 
   private class FinalizeLogSegment extends Task {
@@ -605,19 +611,20 @@ class SegmentedRaftLogWorker {
     public void execute() throws IOException {
       freeSegmentedRaftLogOutputStream();
 
-      final File openFile = getFile(startIndex, null);
+      final LogSegmentStartEnd openStartEnd = LogSegmentStartEnd.valueOf(startIndex);
+      final File openFile = getFile(openStartEnd);
       Preconditions.assertTrue(openFile.exists(),
           () -> name + ": File " + openFile + " to be rolled does not exist");
       if (endIndex - startIndex + 1 > 0) {
         // finalize the current open segment
-        final File dstFile = getFile(startIndex, endIndex);
+        final File dstFile = getFile(LogSegmentStartEnd.valueOf(startIndex, endIndex));
         Preconditions.assertTrue(!dstFile.exists());
 
         FileUtils.move(openFile, dstFile);
         LOG.info("{}: Rolled log segment from {} to {}", name, openFile, dstFile);
       } else { // delete the file of the empty segment
-        FileUtils.deleteFile(openFile);
-        LOG.info("{}: Deleted empty log segment {}", name, openFile);
+        final Path deleted = FileUtils.deleteFile(openFile);
+        LOG.info("{}: Deleted empty RaftLog segment: startEnd={}, path={}", name, openStartEnd, deleted);
       }
       updateFlushedIndexIncreasingly();
       safeCacheEvictIndex.updateToMax(endIndex, traceIndexChange);
@@ -650,7 +657,7 @@ class SegmentedRaftLogWorker {
 
     @Override
     void execute() throws IOException {
-      final File openFile = getFile(newStartIndex, null);
+      final File openFile = getFile(LogSegmentStartEnd.valueOf(newStartIndex));
       Preconditions.assertTrue(!openFile.exists(), "open file %s exists for %s",
           openFile, name);
       Preconditions.assertTrue(pendingFlushNum == 0);
@@ -692,8 +699,8 @@ class SegmentedRaftLogWorker {
           final File delFile = del.getFile(storage);
           Preconditions.assertTrue(delFile.exists(),
               "File %s to be deleted does not exist", delFile);
-          FileUtils.deleteFile(delFile);
-          LOG.info("{}: Deleted log file {}", name, delFile);
+          final Path deleted = FileUtils.deleteFile(delFile);
+          LOG.info("{}: Deleted RaftLog segment for {}: path={}", name, segments.getReason(), deleted);
           minStart = Math.min(minStart, del.getStartIndex());
         }
         if (segments.getToTruncate() == null) {

@@ -160,6 +160,7 @@ class RaftServerImpl implements RaftServer.Division,
   static final String APPEND_TRANSACTION = CLASS_NAME + ".appendTransaction";
   static final String LOG_SYNC = APPEND_ENTRIES + ".logComplete";
   static final String START_LEADER_ELECTION = CLASS_NAME + ".startLeaderElection";
+  static final String START_COMPLETE = CLASS_NAME + ".startComplete";
 
   class Info implements DivisionInfo {
     @Override
@@ -400,7 +401,10 @@ class RaftServerImpl implements RaftServer.Division,
 
     jmxAdapter.registerMBean();
     state.start();
-    startComplete.compareAndSet(false, true);
+    CodeInjectionForTesting.execute(START_COMPLETE, getId(), null, role);
+    if (startComplete.compareAndSet(false, true)) {
+      LOG.info("{}: Successfully started.", getMemberId());
+    }
     return true;
   }
 
@@ -566,20 +570,17 @@ class RaftServerImpl implements RaftServer.Division,
    * @param force Force to start a new {@link FollowerState} even if this server is already a follower.
    * @return if the term/votedFor should be updated to the new term
    */
-  private synchronized boolean changeToFollower(
-      long newTerm,
-      boolean force,
-      boolean allowListener,
-      Object reason) {
+  private synchronized CompletableFuture<Void> changeToFollower(
+      long newTerm, boolean force, boolean allowListener, Object reason, AtomicBoolean metadataUpdated) {
     final RaftPeerRole old = role.getCurrentRole();
     if (old == RaftPeerRole.LISTENER && !allowListener) {
       throw new IllegalStateException("Unexpected role " + old);
     }
-    boolean metadataUpdated;
+    CompletableFuture<Void> future = CompletableFuture.completedFuture(null);
     if ((old != RaftPeerRole.FOLLOWER || force) && old != RaftPeerRole.LISTENER) {
       setRole(RaftPeerRole.FOLLOWER, reason);
       if (old == RaftPeerRole.LEADER) {
-        role.shutdownLeaderState(false)
+        future = role.shutdownLeaderState(false)
             .exceptionally(e -> {
               if (e != null) {
                 if (!getInfo().isAlive()) {
@@ -588,30 +589,33 @@ class RaftServerImpl implements RaftServer.Division,
                 }
               }
               throw new CompletionException("Failed to shutdownLeaderState: " + this, e);
-            })
-            .join();
+            });
         state.setLeader(null, reason);
       } else if (old == RaftPeerRole.CANDIDATE) {
-        role.shutdownLeaderElection();
+        future = role.shutdownLeaderElection();
       } else if (old == RaftPeerRole.FOLLOWER) {
-        role.shutdownFollowerState();
+        future = role.shutdownFollowerState();
       }
-      metadataUpdated = state.updateCurrentTerm(newTerm);
+
+      metadataUpdated.set(state.updateCurrentTerm(newTerm));
       role.startFollowerState(this, reason);
       setFirstElection(reason);
     } else {
-      metadataUpdated = state.updateCurrentTerm(newTerm);
+      metadataUpdated.set(state.updateCurrentTerm(newTerm));
     }
-    return metadataUpdated;
+    return future;
   }
 
-  synchronized void changeToFollowerAndPersistMetadata(
+  synchronized CompletableFuture<Void> changeToFollowerAndPersistMetadata(
       long newTerm,
       boolean allowListener,
       Object reason) throws IOException {
-    if (changeToFollower(newTerm, false, allowListener, reason)) {
+    final AtomicBoolean metadataUpdated = new AtomicBoolean();
+    final CompletableFuture<Void> future = changeToFollower(newTerm, false, allowListener, reason, metadataUpdated);
+    if (metadataUpdated.get()) {
       state.persistMetadata();
     }
+    return future;
   }
 
   synchronized void changeToLeader() {
@@ -661,10 +665,19 @@ class RaftServerImpl implements RaftServer.Division,
 
   LogInfoProto getLogInfo(){
     final RaftLog log = getRaftLog();
-    LogInfoProto.Builder logInfoBuilder = LogInfoProto.newBuilder()
-        .setApplied(getStateMachine().getLastAppliedTermIndex().toProto())
-        .setCommitted(log.getTermIndex(log.getLastCommittedIndex()).toProto())
-        .setLastEntry(log.getLastEntryTermIndex().toProto());
+    LogInfoProto.Builder logInfoBuilder = LogInfoProto.newBuilder();
+    final TermIndex applied = getStateMachine().getLastAppliedTermIndex();
+    if (applied != null) {
+      logInfoBuilder.setApplied(applied.toProto());
+    }
+    final TermIndex committed = log.getTermIndex(log.getLastCommittedIndex());
+    if (committed != null) {
+      logInfoBuilder.setCommitted(committed.toProto());
+    }
+    final TermIndex entry = log.getLastEntryTermIndex();
+    if (entry != null) {
+      logInfoBuilder.setLastEntry(entry.toProto());
+    }
     final SnapshotInfo snapshot = getStateMachine().getLatestSnapshot();
     if (snapshot != null) {
       logInfoBuilder.setLastSnapshot(snapshot.getTermIndex().toProto());
@@ -1443,6 +1456,7 @@ class RaftServerImpl implements RaftServer.Division,
 
     boolean shouldShutdown = false;
     final RequestVoteReplyProto reply;
+    CompletableFuture<Void> future = null;
     synchronized (this) {
       // Check life cycle state again to avoid the PAUSING/PAUSED state.
       assertLifeCycleState(LifeCycle.States.RUNNING);
@@ -1452,12 +1466,12 @@ class RaftServerImpl implements RaftServer.Division,
       final boolean voteGranted = context.decideVote(candidate, candidateLastEntry);
       if (candidate != null && phase == Phase.ELECTION) {
         // change server state in the ELECTION phase
-        final boolean termUpdated =
-            changeToFollower(candidateTerm, true, false, "candidate:" + candidateId);
+        final AtomicBoolean termUpdated = new AtomicBoolean();
+        future = changeToFollower(candidateTerm, true, false, "candidate:" + candidateId, termUpdated);
         if (voteGranted) {
           state.grantVote(candidate.getId());
         }
-        if (termUpdated || voteGranted) {
+        if (termUpdated.get() || voteGranted) {
           state.persistMetadata(); // sync metafile
         }
       }
@@ -1472,6 +1486,9 @@ class RaftServerImpl implements RaftServer.Division,
         LOG.info("{} replies to {} vote request: {}. Peer's state: {}",
             getMemberId(), phase, toRequestVoteReplyString(reply), state);
       }
+    }
+    if (future != null) {
+      future.join();
     }
     return reply;
   }
@@ -1574,6 +1591,7 @@ class RaftServerImpl implements RaftServer.Division,
     final long followerCommit = state.getLog().getLastCommittedIndex();
     final Optional<FollowerState> followerState;
     final Timekeeper.Context timer = raftServerMetrics.getFollowerAppendEntryTimer(isHeartbeat).time();
+    final CompletableFuture<Void> future;
     synchronized (this) {
       // Check life cycle state again to avoid the PAUSING/PAUSED state.
       assertLifeCycleState(LifeCycle.States.STARTING_OR_RUNNING);
@@ -1585,7 +1603,7 @@ class RaftServerImpl implements RaftServer.Division,
             AppendResult.NOT_LEADER, callId, RaftLog.INVALID_LOG_INDEX, isHeartbeat));
       }
       try {
-        changeToFollowerAndPersistMetadata(leaderTerm, true, "appendEntries");
+        future = changeToFollowerAndPersistMetadata(leaderTerm, true, "appendEntries");
       } catch (IOException e) {
         return JavaUtils.completeExceptionally(e);
       }
@@ -1610,12 +1628,12 @@ class RaftServerImpl implements RaftServer.Division,
             AppendResult.INCONSISTENCY, callId, RaftLog.INVALID_LOG_INDEX, isHeartbeat);
         LOG.info("{}: appendEntries* reply {}", getMemberId(), toAppendEntriesReplyString(reply));
         followerState.ifPresent(fs -> fs.updateLastRpcTime(FollowerState.UpdateType.APPEND_COMPLETE));
-        return CompletableFuture.completedFuture(reply);
+        return future.thenApply(dummy -> reply);
       }
 
       state.updateConfiguration(entries);
     }
-
+    future.join();
 
     final List<CompletableFuture<Long>> futures = entries.isEmpty() ? Collections.emptyList()
         : state.getLog().append(requestRef.delegate(entries));

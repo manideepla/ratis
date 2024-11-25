@@ -224,11 +224,8 @@ class LeaderStateImpl implements LeaderState {
     }
 
     CompletableFuture<Void> stopAll() {
-      final CompletableFuture<?>[] futures = new CompletableFuture<?>[senders.size()];
-      for(int i = 0; i < futures.length; i++) {
-        futures[i] = senders.get(i).stopAsync();
-      }
-      return CompletableFuture.allOf(futures);
+      return CompletableFuture.allOf(senders.stream().
+              map(LogAppender::stopAsync).toArray(CompletableFuture[]::new));
     }
   }
 
@@ -710,7 +707,7 @@ class LeaderStateImpl implements LeaderState {
   private void stepDown(long term, StepDownReason reason) {
     try {
       lease.getAndSetEnabled(false);
-      server.changeToFollowerAndPersistMetadata(term, false, reason);
+      server.changeToFollowerAndPersistMetadata(term, false, reason).join();
       pendingStepDown.complete(server::newSuccessReply);
     } catch(IOException e) {
       final String s = this + ": Failed to persist metadata for term " + term;

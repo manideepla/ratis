@@ -192,8 +192,8 @@ public class GrpcLogAppender extends LogAppenderBase {
   }
 
   @Override
-  public GrpcService getServerRpc() {
-    return (GrpcService)super.getServerRpc();
+  public GrpcServicesImpl getServerRpc() {
+    return (GrpcServicesImpl)super.getServerRpc();
   }
 
   private GrpcServerProtocolClient getClient() throws IOException {
@@ -379,7 +379,7 @@ public class GrpcLogAppender extends LogAppenderBase {
   }
 
   private void appendLog(boolean heartbeat) throws IOException {
-    ReferenceCountedObject<AppendEntriesRequestProto> pending = null;
+    final ReferenceCountedObject<AppendEntriesRequestProto> pending;
     final AppendEntriesRequest request;
     try (AutoCloseableLock writeLock = lock.writeLock(caller, LOG::trace)) {
       // Prepare and send the append request.
@@ -388,18 +388,18 @@ public class GrpcLogAppender extends LogAppenderBase {
       if (pending == null) {
         return;
       }
-      request = new AppendEntriesRequest(pending.get(), getFollowerId(), grpcServerMetrics);
-      pendingRequests.put(request);
-      increaseNextIndex(pending.get());
-      if (appendLogRequestObserver == null) {
-        appendLogRequestObserver = new StreamObservers(
-            getClient(), new AppendLogResponseHandler(), useSeparateHBChannel, getWaitTimeMin());
-      }
-    } catch(Exception e) {
-      if (pending != null) {
+      try {
+        request = new AppendEntriesRequest(pending.get(), getFollowerId(), grpcServerMetrics);
+        pendingRequests.put(request);
+        increaseNextIndex(pending.get());
+        if (appendLogRequestObserver == null) {
+          appendLogRequestObserver = new StreamObservers(
+              getClient(), new AppendLogResponseHandler(), useSeparateHBChannel, getWaitTimeMin());
+        }
+      } catch (Exception e) {
         pending.release();
+        throw e;
       }
-      throw e;
     }
 
     try {
@@ -428,7 +428,7 @@ public class GrpcLogAppender extends LogAppenderBase {
 
   private void sendRequest(AppendEntriesRequest request,
       AppendEntriesRequestProto proto) throws InterruptedIOException {
-    CodeInjectionForTesting.execute(GrpcService.GRPC_SEND_SERVER_REQUEST,
+    CodeInjectionForTesting.execute(GrpcServicesImpl.GRPC_SEND_SERVER_REQUEST,
         getServer().getId(), null, proto);
     resetHeartbeatTrigger();
 
@@ -717,6 +717,8 @@ public class GrpcLogAppender extends LogAppenderBase {
           LOG.error("Unrecognized the reply result {}: Leader is {}, follower is {}",
               reply.getResult(), getServer().getId(), getFollowerId());
           break;
+        case SNAPSHOT_EXPIRED:
+          LOG.warn("{}: Follower could not install snapshot as it is expired.", this);
         default:
           break;
       }

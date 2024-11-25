@@ -26,6 +26,7 @@ import org.apache.ratis.util.Timestamp;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.ToIntFunction;
@@ -62,6 +63,7 @@ class FollowerState extends Daemon {
   @SuppressWarnings({"squid:S3077"}) // Suppress volatile for generic type
   private volatile Timestamp lastRpcTime = creationTime;
   private volatile boolean isRunning = true;
+  private final CompletableFuture<Void> stopped = new CompletableFuture<>();
   private final AtomicInteger outstandingOp = new AtomicInteger();
 
   FollowerState(RaftServerImpl server, Object reason) {
@@ -93,8 +95,10 @@ class FollowerState extends Daemon {
     return lastRpcTime.elapsedTime().compareTo(server.properties().minRpcTimeout()) < 0;
   }
 
-  void stopRunning() {
+  CompletableFuture<Void> stopRunning() {
     this.isRunning = false;
+    interrupt();
+    return stopped;
   }
 
   boolean lostMajorityHeartbeatsRecently() {
@@ -122,6 +126,22 @@ class FollowerState extends Daemon {
 
   @Override
   public  void run() {
+    try {
+      runImpl();
+    } finally {
+      stopped.complete(null);
+    }
+  }
+
+  private boolean roleChangeChecking(TimeDuration electionTimeout) {
+    return outstandingOp.get() == 0
+            && isRunning && server.getInfo().isFollower()
+            && lastRpcTime.elapsedTime().compareTo(electionTimeout) >= 0
+            && !lostMajorityHeartbeatsRecently()
+            && server.isRunning();
+  }
+
+  private void runImpl() {
     final TimeDuration sleepDeviationThreshold = server.getSleepDeviationThreshold();
     while (shouldRun()) {
       final TimeDuration electionTimeout = server.getRandomElectionTimeout();
@@ -137,10 +157,7 @@ class FollowerState extends Daemon {
           break;
         }
         synchronized (server) {
-          if (outstandingOp.get() == 0
-              && isRunning && server.getInfo().isFollower()
-              && lastRpcTime.elapsedTime().compareTo(electionTimeout) >= 0
-              && !lostMajorityHeartbeatsRecently()) {
+          if (roleChangeChecking(electionTimeout)) {
             LOG.info("{}: change to CANDIDATE, lastRpcElapsedTime:{}, electionTimeout:{}",
                 this, lastRpcTime.elapsedTime(), electionTimeout);
             server.getLeaderElectionMetrics().onLeaderElectionTimeout(); // Update timeout metric counters.
