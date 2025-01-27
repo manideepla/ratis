@@ -26,7 +26,6 @@ import org.apache.ratis.server.raftlog.LogProtoUtils;
 import org.apache.ratis.server.raftlog.RaftLogIOException;
 import org.apache.ratis.server.storage.RaftStorage;
 import org.apache.ratis.thirdparty.com.google.common.annotations.VisibleForTesting;
-import org.apache.ratis.thirdparty.com.google.common.cache.CacheLoader;
 import org.apache.ratis.thirdparty.com.google.protobuf.CodedOutputStream;
 import org.apache.ratis.util.FileUtils;
 import org.apache.ratis.util.JavaUtils;
@@ -266,15 +265,14 @@ public final class LogSegment {
    *
    * In the future we can make the cache loader configurable if necessary.
    */
-  class LogEntryLoader extends CacheLoader<LogRecord, ReferenceCountedObject<LogEntryProto>> {
+  class LogEntryLoader {
     private final SegmentedRaftLogMetrics raftLogMetrics;
 
     LogEntryLoader(SegmentedRaftLogMetrics raftLogMetrics) {
       this.raftLogMetrics = raftLogMetrics;
     }
 
-    @Override
-    public ReferenceCountedObject<LogEntryProto> load(LogRecord key) throws IOException {
+    ReferenceCountedObject<LogEntryProto> load(TermIndex key) throws IOException {
       final File file = getFile();
       // note the loading should not exceed the endIndex: it is possible that
       // the on-disk log file should be truncated but has not been done yet.
@@ -282,16 +280,19 @@ public final class LogSegment {
       final LogSegmentStartEnd startEnd = LogSegmentStartEnd.valueOf(startIndex, endIndex, isOpen);
       readSegmentFile(file, startEnd, maxOpSize, getLogCorruptionPolicy(), raftLogMetrics, entryRef -> {
         final LogEntryProto entry = entryRef.retain();
-        final TermIndex ti = TermIndex.valueOf(entry);
-        putEntryCache(ti, entryRef, Op.LOAD_SEGMENT_FILE);
-        if (ti.equals(key.getTermIndex())) {
-          toReturn.set(entryRef);
-        } else {
+        try {
+          final TermIndex ti = TermIndex.valueOf(entry);
+          putEntryCache(ti, entryRef, Op.LOAD_SEGMENT_FILE);
+          if (ti.equals(key)) {
+            entryRef.retain();
+            toReturn.set(entryRef);
+          }
+        } finally {
           entryRef.release();
         }
       });
       loadingTimes.incrementAndGet();
-      return Objects.requireNonNull(toReturn.get());
+      return Objects.requireNonNull(toReturn.get(), () -> "toReturn == null for " + key);
     }
   }
 
@@ -488,8 +489,8 @@ public final class LogSegment {
   /**
    * Acquire LogSegment's monitor so that there is no concurrent loading.
    */
-  synchronized ReferenceCountedObject<LogEntryProto> loadCache(LogRecord record) throws RaftLogIOException {
-    ReferenceCountedObject<LogEntryProto> entry = entryCache.get(record.getTermIndex());
+  synchronized ReferenceCountedObject<LogEntryProto> loadCache(TermIndex ti) throws RaftLogIOException {
+    final ReferenceCountedObject<LogEntryProto> entry = entryCache.get(ti);
     if (entry != null) {
       try {
         entry.retain();
@@ -500,7 +501,7 @@ public final class LogSegment {
       }
     }
     try {
-      return cacheLoader.load(record);
+      return cacheLoader.load(ti);
     } catch (Exception e) {
       throw new RaftLogIOException(e);
     }

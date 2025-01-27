@@ -133,6 +133,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
@@ -205,6 +206,14 @@ class RaftServerImpl implements RaftServer.Division,
           .map(LeaderStateImpl::getFollowerNextIndices)
           .orElse(null);
     }
+
+    @Override
+    public long[] getFollowerMatchIndices() {
+      return role.getLeaderState()
+          .filter(leader -> isLeader())
+          .map(LeaderStateImpl::getFollowerMatchIndices)
+          .orElse(null);
+    }
   }
 
   private final RaftServerProxy proxy;
@@ -250,6 +259,8 @@ class RaftServerImpl implements RaftServer.Division,
   private final AtomicBoolean firstElectionSinceStartup = new AtomicBoolean(true);
   private final ThreadGroup threadGroup;
 
+  private final AtomicReference<CompletableFuture<Void>> appendLogFuture;
+
   RaftServerImpl(RaftGroup group, StateMachine stateMachine, RaftServerProxy proxy, RaftStorage.StartupOption option)
       throws IOException {
     final RaftPeerId id = proxy.getId();
@@ -283,6 +294,7 @@ class RaftServerImpl implements RaftServer.Division,
     this.transferLeadership = new TransferLeadership(this, properties);
     this.snapshotRequestHandler = new SnapshotManagementRequestHandler(this);
     this.snapshotInstallationHandler = new SnapshotInstallationHandler(this, properties);
+    this.appendLogFuture = new AtomicReference<>(CompletableFuture.completedFuture(null));
 
     this.serverExecutor = ConcurrentUtils.newThreadPoolWithMax(
         RaftServerConfigKeys.ThreadPool.serverCached(properties),
@@ -631,6 +643,15 @@ class RaftServerImpl implements RaftServer.Division,
 
   @Override
   public Collection<CommitInfoProto> getCommitInfos() {
+    try {
+      return getCommitInfosImpl();
+    } catch (Throwable t) {
+      LOG.warn("{} Failed to getCommitInfos", getMemberId(), t);
+      return Collections.emptyList();
+    }
+  }
+
+  private Collection<CommitInfoProto> getCommitInfosImpl() {
     final List<CommitInfoProto> infos = new ArrayList<>();
     // add the commit info of this server
     final long commitIndex = updateCommitInfoCache();
@@ -922,17 +943,10 @@ class RaftServerImpl implements RaftServer.Division,
   public CompletableFuture<RaftClientReply> submitClientRequestAsync(
       ReferenceCountedObject<RaftClientRequest> requestRef) {
     final RaftClientRequest request = requestRef.retain();
-    LOG.debug("{}: receive client request({})", getMemberId(), request);
-
     try {
+      LOG.debug("{}: receive client request({})", getMemberId(), request);
       assertLifeCycleState(LifeCycle.States.RUNNING);
-    } catch (ServerNotReadyException e) {
-      final RaftClientReply reply = newExceptionReply(request, e);
-      requestRef.release();
-      return CompletableFuture.completedFuture(reply);
-    }
 
-    try {
       RaftClientRequest.Type type = request.getType();
       final Timekeeper timer = raftServerMetrics.getClientRequestTimer(type);
       final Optional<Timekeeper.Context> timerContext = Optional.ofNullable(timer).map(Timekeeper::time);
@@ -942,6 +956,11 @@ class RaftServerImpl implements RaftServer.Division,
           raftServerMetrics.incFailedRequestCount(type);
         }
       });
+    } catch (RaftException e) {
+      return CompletableFuture.completedFuture(newExceptionReply(request, e));
+    } catch (Throwable t) {
+      LOG.error("{} Failed to submitClientRequestAsync for {}", getMemberId(), request, t);
+      return CompletableFuture.completedFuture(newExceptionReply(request, new RaftException(t)));
     } finally {
       requestRef.release();
     }
@@ -1634,9 +1653,9 @@ class RaftServerImpl implements RaftServer.Division,
       state.updateConfiguration(entries);
     }
     future.join();
+    final CompletableFuture<Void> appendLog = entries.isEmpty()? CompletableFuture.completedFuture(null)
+        : appendLog(requestRef.delegate(entries));
 
-    final List<CompletableFuture<Long>> futures = entries.isEmpty() ? Collections.emptyList()
-        : state.getLog().append(requestRef.delegate(entries));
     proto.getCommitInfosList().forEach(commitInfoCache::update);
 
     CodeInjectionForTesting.execute(LOG_SYNC, getId(), null);
@@ -1650,7 +1669,7 @@ class RaftServerImpl implements RaftServer.Division,
 
     final long commitIndex = effectiveCommitIndex(proto.getLeaderCommit(), previous, entries.size());
     final long matchIndex = isHeartbeat? RaftLog.INVALID_LOG_INDEX: entries.get(entries.size() - 1).getIndex();
-    return JavaUtils.allOf(futures).whenCompleteAsync((r, t) -> {
+    return appendLog.whenCompleteAsync((r, t) -> {
       followerState.ifPresent(fs -> fs.updateLastRpcTime(FollowerState.UpdateType.APPEND_COMPLETE));
       timer.stop();
     }, getServerExecutor()).thenApply(v -> {
@@ -1666,6 +1685,12 @@ class RaftServerImpl implements RaftServer.Division,
           + ": appendEntries* reply " + toAppendEntriesReplyString(reply));
       return reply;
     });
+  }
+  private CompletableFuture<Void> appendLog(ReferenceCountedObject<List<LogEntryProto>> entriesRef) {
+    entriesRef.retain();
+    return appendLogFuture.updateAndGet(f -> f.thenCompose(
+            ignored -> JavaUtils.allOf(state.getLog().append(entriesRef))))
+        .whenComplete((v, e) -> entriesRef.release());
   }
 
   private long checkInconsistentAppendEntries(TermIndex previous, List<LogEntryProto> entries) {

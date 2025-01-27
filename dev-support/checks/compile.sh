@@ -20,34 +20,12 @@ source "${DIR}/../find_maven.sh"
 
 : ${WITH_COVERAGE:="false"}
 
-MAVEN_OPTIONS='-B -fae'
-
-if ! type unionBugs >/dev/null 2>&1 || ! type convertXmlToText >/dev/null 2>&1; then
-  #shellcheck disable=SC2086
-  ${MVN} ${MAVEN_OPTIONS} test-compile spotbugs:check
-  exit $?
-fi
+MAVEN_OPTIONS='-V -B -Dmaven.javadoc.skip=true -DskipTests'
 
 if [[ "${WITH_COVERAGE}" != "true" ]]; then
   MAVEN_OPTIONS="${MAVEN_OPTIONS} -Djacoco.skip"
 fi
 
-#shellcheck disable=SC2086
-${MVN} ${MAVEN_OPTIONS} test-compile spotbugs:spotbugs
-rc=$?
-
-REPORT_DIR=${OUTPUT_DIR:-"$DIR/../../target/findbugs"}
-mkdir -p "$REPORT_DIR"
-REPORT_FILE="$REPORT_DIR/summary.txt"
-
-find ratis* -name spotbugsXml.xml -print0 | xargs -0 unionBugs -output "${REPORT_DIR}"/summary.xml
-convertXmlToText "${REPORT_DIR}"/summary.xml | tee "${REPORT_FILE}"
-convertXmlToText -html:fancy-hist.xsl "${REPORT_DIR}"/summary.xml "${REPORT_DIR}"/summary.html
-
-wc -l "$REPORT_FILE" | awk '{print $1}'> "$REPORT_DIR/failures"
-
-if [[ -s "${REPORT_FILE}" ]]; then
-   exit 1
-fi
-
-exit ${rc}
+export MAVEN_OPTS="-Xmx4096m"
+${MVN} ${MAVEN_OPTIONS} clean verify "$@"
+exit $?
