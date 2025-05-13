@@ -46,6 +46,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.NavigableMap;
 import java.util.TreeMap;
+import java.util.Objects;
 import java.util.concurrent.TimeUnit;
 
 /** Server utilities for internal use. */
@@ -136,15 +137,20 @@ public final class ServerImplUtils {
       return floorEntry.getValue().getTerm(index);
     }
 
-    synchronized void append(List<ConsecutiveIndices> entriesTermIndices) {
-      for(ConsecutiveIndices indices : entriesTermIndices) {
-        // validate startIndex
-        final Map.Entry<Long, ConsecutiveIndices> lastEntry = map.lastEntry();
-        if (lastEntry != null) {
-          Preconditions.assertSame(lastEntry.getValue().getNextIndex(), indices.startIndex, "startIndex");
+    synchronized boolean append(List<ConsecutiveIndices> entriesTermIndices) {
+      for(int i = 0; i < entriesTermIndices.size(); i++) {
+        final ConsecutiveIndices indices = entriesTermIndices.get(i);
+        final ConsecutiveIndices previous = map.put(indices.startIndex, indices);
+        if (previous != null) {
+          // index already exists, revert this append
+          map.put(previous.startIndex, previous);
+          for(int j = 0; j < i; j++) {
+            map.remove(entriesTermIndices.get(j).startIndex);
+          }
+          return false;
         }
-        map.put(indices.startIndex, indices);
       }
+      return true;
     }
 
     synchronized void removeExisting(List<ConsecutiveIndices> entriesTermIndices) {
@@ -165,8 +171,8 @@ public final class ServerImplUtils {
       ThreadGroup threadGroup, RaftProperties properties, Parameters parameters) throws IOException {
     RaftServer.LOG.debug("newRaftServer: {}, {}", id, group);
     if (group != null && !group.getPeers().isEmpty()) {
-      Preconditions.assertNotNull(id, "RaftPeerId %s is not in RaftGroup %s", id, group);
-      Preconditions.assertNotNull(group.getPeer(id), "RaftPeerId %s is not in RaftGroup %s", id, group);
+      Objects.requireNonNull(id, () -> "RaftPeerId " + id + " is not in RaftGroup " + group);
+      Objects.requireNonNull(group.getPeer(id), () -> "RaftPeerId " + id + " is not in RaftGroup " + group);
     }
     final RaftServerProxy proxy = newRaftServer(id, stateMachineRegistry, threadGroup, properties, parameters);
     proxy.initGroups(group, option);
